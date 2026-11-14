@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -42,6 +43,19 @@ static int  drag_x, drag_y;              /* world position of dragged monitor */
 static int  press_px, press_py, press_wx, press_wy;
 static double m_scale, m_ox, m_oy;       /* world -> area mapping (frozen)    */
 static int  refresh_soon;
+
+/* right-click context menu on the "Displays" list */
+#define MENU_W   150
+#define MENU_H   30
+static char menu_mon[32];                /* output name, "" = menu closed     */
+static int  menu_x, menu_y;
+
+/* "Compositor management" button (header, top right) and its drop-down */
+#define CM_LABEL  "Compositor management"
+#define CM_H      26
+#define CM_ITEM_H 30
+#define CM_NITEMS 3
+static int cm_open, cm_hover, cm_item = -1;     /* cm_item: hovered item */
 
 /* ------------------------------------------------------------------ */
 /* Brightness                                                          */
@@ -156,6 +170,44 @@ static void run_argv(char **argv)
     app_run_ex(argv[0], (const char *const *)&argv[1], NULL, NULL);
     refresh_soon = 2;
 }
+
+static const char *display_script(void)
+{
+    const char *s = getenv("SYSTRAY_DISPLAY_SCRIPT");
+    return s && *s ? s : DISPLAY_SCRIPT_DEFAULT;
+}
+
+/* Run "xrandr <xargs...>" (xargs NULL-terminated).  With restart_panel set,
+ * once xrandr has succeeded "display-change.sh --restart-panel" restarts
+ * tint2 (it stays on the output that was primary when it started, so it
+ * must follow a primary change) and this systray (so its icons dock into
+ * the new panel in their proper place).  That is the same code the udev
+ * hot-plug handler uses, under one lock, so the two can never race into a
+ * second tint2.  The script runs detached (app_run_ex double-forks +
+ * setsid), so it survives this process being killed.  The xrandr arguments
+ * go through "$@", never into the script text. */
+static void run_xrandr(char *const *xargs, int restart_panel)
+{
+    static const char script[] =
+        "panel=$1; shift\n"
+        "xrandr \"$@\" || exit\n"
+        "exec \"$panel\" --restart-panel\n";
+
+    char *argv[40];
+    int n = 0;
+    if (restart_panel) {
+        argv[n++] = "sh";
+        argv[n++] = "-c";
+        argv[n++] = (char *)script;
+        argv[n++] = "sh";                       /* $0 */
+        argv[n++] = (char *)display_script();
+    } else {
+        argv[n++] = "xrandr";
+    }
+    for (int k = 0; xargs[k] && n < 39; k++) argv[n++] = xargs[k];
+    argv[n] = NULL;
+    run_argv(argv);
+}
 static int overlaps(int ax, int ay, int aw, int ah, int bx, int by, int bw, int bh)
 {
     return ax < bx + bw && bx < ax + aw && ay < by + bh && by < ay + ah;
@@ -233,15 +285,69 @@ static void apply_layout(void)
 static void set_primary(Mon *m)
 {
     if (m->active) {
-        char *argv[] = {"xrandr", "--output", m->name, "--primary", NULL};
-        run_argv(argv);
+        if (m->primary) return;                 /* nothing changes */
+        char *xargs[] = {"--output", m->name, "--primary", NULL};
+        run_xrandr(xargs, 1);
     } else {
         const char *right_of = NULL;
         for (int i = 0; i < nmon; i++) if (mons[i].active) { right_of = mons[i].name; break; }
-        char *argv[] = {"xrandr", "--output", m->name, "--auto", "--primary",
-                        (char *)(right_of ? "--right-of" : NULL), (char *)right_of, NULL};
-        run_argv(argv);
+        char *xargs[] = {"--output", m->name, "--auto", "--primary",
+                         (char *)(right_of ? "--right-of" : NULL), (char *)right_of, NULL};
+        run_xrandr(xargs, 1);
     }
+}
+
+/* Laptop panels are named eDP-1 / eDP1 / LVDS-1 / LVDS1 ... */
+static int is_internal(const Mon *m)
+{
+    return !strncmp(m->name, "eDP", 3) || !strncmp(m->name, "LVDS", 4);
+}
+
+static int active_count(void)
+{
+    int n = 0;
+    for (int i = 0; i < nmon; i++) n += mons[i].active;
+    return n;
+}
+
+/* Turn an output off.  If it is the primary, hand the primary role to the
+ * internal panel (eDP / LVDS) when connected, otherwise to another active
+ * output.  One xrandr call, so there is never a moment without a primary. */
+static void disable_display(Mon *m)
+{
+    if (!m->active) return;
+    if (active_count() <= 1) {
+        fprintf(stderr, "systray: not disabling '%s': it is the only active display\n",
+                m->name);
+        return;
+    }
+
+    Mon *np = NULL;
+    if (m->primary) {
+        for (int i = 0; i < nmon && !np; i++)
+            if (&mons[i] != m && is_internal(&mons[i])) np = &mons[i];
+        for (int i = 0; i < nmon && !np; i++)
+            if (&mons[i] != m && mons[i].active) np = &mons[i];
+    }
+
+    char *argv[16];
+    int n = 0;
+    argv[n++] = "--output"; argv[n++] = m->name; argv[n++] = "--off";
+    if (np) {
+        argv[n++] = "--output"; argv[n++] = np->name;
+        if (!np->active) {
+            /* internal panel is connected but off: switch it on next to a
+             * display that stays on */
+            const char *ref = NULL;
+            for (int i = 0; i < nmon && !ref; i++)
+                if (&mons[i] != m && &mons[i] != np && mons[i].active) ref = mons[i].name;
+            argv[n++] = "--auto";
+            if (ref) { argv[n++] = "--right-of"; argv[n++] = (char *)ref; }
+        }
+        argv[n++] = "--primary";
+    }
+    argv[n] = NULL;
+    run_xrandr(argv, m->primary);   /* primary moved: tint2 must follow */
 }
 
 /* ------------------------------------------------------------------ */
@@ -344,6 +450,108 @@ static void popup_size(int *w, int *h)
     *h = L.h;
 }
 
+/* ------------------------------------------------------------------ */
+/* Compositor management                                               */
+/* ------------------------------------------------------------------ */
+
+static const char *compositor_script(void)
+{
+    const char *s = getenv("SYSTRAY_COMPOSITOR_SCRIPT");
+    return s && *s ? s : COMPOSITOR_SCRIPT_DEFAULT;
+}
+
+/* started with X while the xinitrc.d symlink exists */
+static int compositor_enabled(void)
+{
+    struct stat st;
+    return lstat(COMPOSITOR_LINK, &st) == 0;
+}
+
+static const char *cm_item_label(int i)
+{
+    switch (i) {
+    case 0:  return "Restart compositor";
+    case 1:  return "Stop compositor";
+    default: return compositor_enabled() ? "Disable compositor" : "Enable compositor";
+    }
+}
+
+static void cm_button_rect(double *x, double *y, double *w)
+{
+    *w = ui_text_width(CM_LABEL, 11, 0) + 34;            /* text + chevron */
+    *x = POP_W - UI_PAD - *w;
+    *y = (UI_HEADER_H - CM_H) / 2.0;
+}
+
+static void cm_menu_rect(double *x, double *y, double *w)
+{
+    double bx, by, bw;
+    cm_button_rect(&bx, &by, &bw);
+    *w = bw < 190 ? 190 : bw;
+    *x = POP_W - UI_PAD - *w;                            /* right aligned */
+    *y = by + CM_H + 4;
+}
+
+static int cm_item_at(int px, int py)
+{
+    double x, y, w;
+    cm_menu_rect(&x, &y, &w);
+    if (!IN_RECT(px, py, x, y, w, CM_NITEMS * CM_ITEM_H)) return -1;
+    return (int)((py - y) / CM_ITEM_H);
+}
+
+static int cm_button_at(int px, int py)
+{
+    double x, y, w;
+    cm_button_rect(&x, &y, &w);
+    return IN_RECT(px, py, x, y, w, CM_H);
+}
+
+static void compositor_action(int i)
+{
+    const char *arg = i == 0 ? "restart" : i == 1 ? "stop"
+                    : compositor_enabled() ? "disable" : "enable";
+    app_run(compositor_script(), arg, NULL, NULL);
+    refresh_soon = 2;                      /* redraw: Enable/Disable label */
+}
+
+static void draw_compositor(cairo_t *cr)
+{
+    double x, y, w;
+    cm_button_rect(&x, &y, &w);
+    if (cm_hover || cm_open) ui_fill(cr, x, y, w, CM_H, C_ROW);
+    ui_frame(cr, x, y, w, CM_H, cm_open ? C_ACCENT : C_LINE);
+    ui_text(cr, CM_LABEL, x + 10, y + CM_H / 2.0, 11, 0, cm_hover || cm_open ? C_FG : C_DIM, 0);
+    /* chevron */
+    double cx = x + w - 13, cy = y + CM_H / 2.0;
+    ui_color(cr, cm_hover || cm_open ? C_FG : C_DIM);
+    cairo_set_line_width(cr, 1.5);
+    cairo_move_to(cr, cx - 4, cy - 2);
+    cairo_line_to(cr, cx, cy + 2);
+    cairo_line_to(cr, cx + 4, cy - 2);
+    cairo_stroke(cr);
+
+    if (cm_open) {
+        double mx, my, mw;
+        cm_menu_rect(&mx, &my, &mw);
+        ui_fill(cr, mx, my, mw, CM_NITEMS * CM_ITEM_H, (Rgba){0.16, 0.17, 0.22, 1});
+        for (int i = 0; i < CM_NITEMS; i++) {
+            double iy = my + i * CM_ITEM_H;
+            if (i == cm_item) ui_fill(cr, mx + 1, iy + 1, mw - 2, CM_ITEM_H - 2, C_ROW);
+            ui_text(cr, cm_item_label(i), mx + 12, iy + CM_ITEM_H / 2.0, 12, 0, C_FG, mw - 24);
+        }
+        ui_frame(cr, mx, my, mw, CM_NITEMS * CM_ITEM_H, C_LINE);
+    } else if (cm_hover) {
+        /* tooltip below the button, right aligned */
+        const char *tip = "Seeing UI glitches?";
+        double tw = ui_text_width(tip, 11, 0) + 16, th = 22;
+        double tx = POP_W - UI_PAD - tw, ty = y + CM_H + 6;
+        ui_fill(cr, tx, ty, tw, th, (Rgba){0.04, 0.045, 0.06, 1});
+        ui_frame(cr, tx, ty, tw, th, C_ACCENT);
+        ui_text(cr, tip, tx + 8, ty + th / 2, 11, 0, C_FG, 0);
+    }
+}
+
 static void popup_draw(cairo_t *cr, int w, int h)
 {
     (void)h;
@@ -401,6 +609,18 @@ static void popup_draw(cairo_t *cr, int w, int h)
         ui_text(cr, extra, UI_PAD + 32 + tw, y + UI_ROW_H / 2.0 - 1, 13, 0, C_DIM, 0);
         if (mons[i].primary) draw_check(cr, w - UI_PAD - 6, y + UI_ROW_H / 2.0 - 1, C_DIM);
     }
+
+    if (menu_mon[0]) {
+        int can = 0;
+        for (int i = 0; i < nmon; i++)
+            if (!strcmp(mons[i].name, menu_mon)) can = mons[i].active && active_count() > 1;
+        ui_fill(cr, menu_x, menu_y, MENU_W, MENU_H, (Rgba){0.16, 0.17, 0.22, 1});
+        ui_frame(cr, menu_x, menu_y, MENU_W, MENU_H, C_LINE);
+        ui_text(cr, "Disable display", menu_x + 12, menu_y + MENU_H / 2.0, 12, 0,
+                can ? C_FG : C_DIM, MENU_W - 24);
+    }
+
+    draw_compositor(cr);                   /* last: its menu is on top */
 }
 
 /* ------------------------------------------------------------------ */
@@ -409,6 +629,9 @@ static void popup_draw(cairo_t *cr, int w, int h)
 
 static void popup_motion(int x, int y)
 {
+    cm_hover = !slider_drag && mon_drag < 0 && cm_button_at(x, y);
+    cm_item = cm_open ? cm_item_at(x, y) : -1;
+
     if (slider_drag) {
         int pct = (int)(ui_slider_value(x, SL_X, SL_W) * 100 + 0.5);
         set_brightness(pct);
@@ -441,6 +664,44 @@ static void popup_button(int x, int y, int button, int pressed)
     if (button == 4 || button == 5) {
         if (bl_dir[0] && y < L.a_label - 10)
             set_brightness(bl_pct + (button == 4 ? 5 : -5));
+        return;
+    }
+
+    /* compositor menu open: a left click on an item acts, any other click
+     * (including one on the button) closes it */
+    if (cm_open) {
+        int it = button == 1 ? cm_item_at(x, y) : -1;
+        cm_open = 0;
+        cm_item = -1;
+        if (it >= 0) compositor_action(it);
+        return;
+    }
+    if (button == 1 && cm_button_at(x, y)) {
+        menu_mon[0] = 0;
+        cm_open = 1;
+        cm_item = -1;
+        return;
+    }
+
+    /* context menu open: a left click on it acts, any other click closes it */
+    if (menu_mon[0]) {
+        int hit = button == 1 && IN_RECT(x, y, menu_x, menu_y, MENU_W, MENU_H);
+        if (hit)
+            for (int i = 0; i < nmon; i++)
+                if (!strcmp(mons[i].name, menu_mon)) { disable_display(&mons[i]); break; }
+        menu_mon[0] = 0;
+        return;
+    }
+
+    if (button == 3) {
+        if (y >= L.l_rows && y < L.l_rows + nmon * UI_ROW_H) {
+            int i = (y - L.l_rows) / UI_ROW_H;
+            if (i >= 0 && i < nmon && mons[i].active) {
+                snprintf(menu_mon, sizeof menu_mon, "%s", mons[i].name);
+                menu_x = clampi(x, 4, POP_W - MENU_W - 4);
+                menu_y = y + MENU_H + 4 <= L.h ? y : y - MENU_H;
+            }
+        }
         return;
     }
     if (button != 1) return;
@@ -481,6 +742,9 @@ static int is_open;
 static void popup_open(void)
 {
     is_open = 1;
+    menu_mon[0] = 0;
+    cm_open = cm_hover = 0;
+    cm_item = -1;
     slider_drag = 0;
     mon_drag = -1;
     refresh_monitors();
@@ -490,6 +754,9 @@ static void popup_open(void)
 static void popup_close(void)
 {
     is_open = 0;
+    menu_mon[0] = 0;
+    cm_open = cm_hover = 0;
+    cm_item = -1;
     slider_drag = 0;
     mon_drag = -1;
 }

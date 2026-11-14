@@ -49,6 +49,16 @@ extern const Module audio_module, display_module, network_module, battery_module
 #ifndef NET_SCRIPT_DEFAULT
 #define NET_SCRIPT_DEFAULT   "/usr/lib/kwort/network-setup.sh"
 #endif
+#ifndef DISPLAY_SCRIPT_DEFAULT
+#define DISPLAY_SCRIPT_DEFAULT "/usr/lib/kwort/display-change.sh"
+#endif
+#ifndef COMPOSITOR_SCRIPT_DEFAULT
+#define COMPOSITOR_SCRIPT_DEFAULT "/usr/lib/kwort/compositor.sh"
+#endif
+/* compositor is started with X while this symlink exists */
+#ifndef COMPOSITOR_LINK
+#define COMPOSITOR_LINK      "/etc/X11/xinit/xinitrc.d/0-compositor.sh"
+#endif
 #ifndef POWER_SCRIPT_DEFAULT
 #define POWER_SCRIPT_DEFAULT "/usr/lib/kwort/power-profile.sh"
 #endif
