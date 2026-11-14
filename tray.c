@@ -333,17 +333,31 @@ static void icon_dock(Icon *i, Window owner)
     XSync(g_dpy, False);
 }
 
-/* (Re)create and dock icons whenever a tray manager (re)appears. */
-static void check_tray(void)
+static int redock_pending;     /* an icon was dropped by the tray manager */
+
+/* (Re)create and dock icons whenever a tray manager (re)appears.
+ *
+ * force: re-dock everything even if the selection owner has the same window
+ * id as before.  A tray that restarts itself (tint2 re-execs when a
+ * compositor starts or stops) reconnects at once and the X server hands it
+ * the client slot it just freed, so its new tray window very often gets the
+ * SAME id: comparing ids alone then misses the restart and the icons stay
+ * undocked.  The MANAGER broadcast (and an icon reparented back to the
+ * root) is the reliable signal. */
+static void check_tray(int force)
 {
     Window o = XGetSelectionOwner(g_dpy, a_sel);
-    if (o != last_owner) {
+    if (o != last_owner || force || redock_pending) {
+        if (o && (force || redock_pending || last_owner))
+            fprintf(stderr, "systray: tray manager 0x%lx %s: re-docking icons\n",
+                    (unsigned long)o, o != last_owner ? "appeared" : "restarted");
         for (int i = 0; i < nicons; i++)
             if (icons[i].win) {
                 XDestroyWindow(g_dpy, icons[i].win);
                 icons[i].win = 0;
             }
         last_owner = o;
+        redock_pending = 0;
     }
     if (!o) return;
     for (int i = 0; i < nicons; i++) {
@@ -745,10 +759,23 @@ static void handle_event(XEvent *ev)
         break;
     }
 
+    case ReparentNotify: {
+        /* the tray let go of an icon (e.g. while restarting): it is back
+         * on the root window.  Re-dock all icons on the next check (all of
+         * them, to keep their order). */
+        Icon *i = icon_for(ev->xreparent.window);
+        if (i && ev->xreparent.parent == g_root) {
+            fprintf(stderr, "systray: %s icon was released by the tray\n", i->m->name);
+            redock_pending = 1;
+        }
+        break;
+    }
+
     case ClientMessage:
+        /* a (new or restarted) tray manager announces itself */
         if (ev->xclient.message_type == a_manager &&
             (Atom)ev->xclient.data.l[1] == a_sel)
-            check_tray();
+            check_tray(1);
         break;
 
     case EnterNotify: {
@@ -858,7 +885,7 @@ int main(void)
         icons[nicons++].m = mods[k];
     }
 
-    check_tray();
+    check_tray(0);
     redraw_icons();
 
     int xfd = ConnectionNumber(g_dpy);
@@ -887,7 +914,7 @@ int main(void)
 
         if (t - last_tick >= 1000) {
             last_tick = t;
-            check_tray();
+            check_tray(0);
             for (int i = 0; i < nicons; i++)
                 if (icons[i].m->tick && icons[i].m->tick()) dirty = 1;
         }
