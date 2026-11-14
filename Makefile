@@ -14,6 +14,8 @@ LDLIBS  := $(shell pkg-config --libs $(PKGS)) -lpthread -lm
 PREFIX    ?= /usr
 SCRIPTDIR ?= /usr/lib/kwort
 UDEVDIR   ?= /etc/udev/rules.d
+XINITRCDIR ?= /etc/X11/xinit/xinitrc.d
+SUDOERSDIR ?= /etc/sudoers.d
 # Staged installs (packaging) never need sudo: make install DESTDIR=$(pwd)/pkg
 ifneq ($(strip $(DESTDIR)),)
 SUDO      ?=
@@ -37,14 +39,27 @@ else
 endif
 	$(SUDO) install -Dm755 network-setup.sh $(DESTDIR)$(SCRIPTDIR)/network-setup.sh
 	$(SUDO) install -Dm755 power-profile.sh $(DESTDIR)$(SCRIPTDIR)/power-profile.sh
-	$(SUDO) install -Dm755 disable-display.sh $(DESTDIR)$(SCRIPTDIR)/disable-display.sh
+	@# first install only: enable the compositor (keep a later "disable")
+	@if [ ! -e $(DESTDIR)$(SCRIPTDIR)/compositor.sh ]; then \
+		echo "enabling compositor: $(XINITRCDIR)/0-compositor.sh"; \
+		$(SUDO) install -d $(DESTDIR)$(XINITRCDIR); \
+		$(SUDO) ln -sfn $(SCRIPTDIR)/compositor.sh $(DESTDIR)$(XINITRCDIR)/0-compositor.sh; \
+	fi
+	$(SUDO) install -Dm755 compositor.sh $(DESTDIR)$(SCRIPTDIR)/compositor.sh
+	$(SUDO) install -Dm755 display-change.sh $(DESTDIR)$(SCRIPTDIR)/display-change.sh
+	-$(SUDO) rm -f $(DESTDIR)$(SCRIPTDIR)/disable-display.sh   # renamed to display-change.sh
 	$(SUDO) install -Dm644 89-kwort-video.rules $(DESTDIR)$(UDEVDIR)/89-kwort-video.rules
+	@# sudoers: paths follow SCRIPTDIR; refuse to install a file visudo rejects
+	sed "s#/usr/lib/kwort/#$(SCRIPTDIR)/#g" kwort-systray.sudoers > kwort-systray.sudoers.out
+	if command -v visudo >/dev/null 2>&1; then visudo -cf kwort-systray.sudoers.out; fi
+	$(SUDO) install -Dm440 kwort-systray.sudoers.out $(DESTDIR)$(SUDOERSDIR)/kwort-systray
+	rm -f kwort-systray.sudoers.out
 ifeq ($(strip $(DESTDIR)),)
 	-$(SUDO) udevadm control --reload-rules
 	-$(SUDO) udevadm trigger --subsystem-match=backlight
 endif
 
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -f $(OBJS) $(TARGET) kwort-systray.sudoers.out
 
 .PHONY: all install clean

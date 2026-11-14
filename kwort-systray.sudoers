@@ -1,0 +1,43 @@
+# /etc/sudoers.d/kwort-systray - passwordless root for the few steps of the
+# kwort-systray helper scripts that need it.  Installed by "make install"
+# (mode 0440, checked with "visudo -cf" first).  Edit with:
+#     visudo -f /etc/sudoers.d/kwort-systray
+#
+# Every rule allows ONE exact command line, so the scripts can do their job
+# and nothing else.  The scripts call sudo with these exact paths (they
+# resolve themselves with "readlink -f"), so keep them in sync with
+# SCRIPTDIR if the scripts are installed somewhere else.
+#
+# Who may use them: the members of the "users" group.  Change it to fit your
+# system, e.g. "%wheel" or a single login name.
+User_Alias  KWORT_USERS = %users
+
+# power-profile.sh <profile>: writes the cpufreq governor / EPP and the ACPI
+# platform profile in sysfs.  The script re-runs itself with a normalised
+# profile name.
+Cmnd_Alias  KWORT_POWER = /usr/lib/kwort/power-profile.sh power-saver, \
+                          /usr/lib/kwort/power-profile.sh balanced, \
+                          /usr/lib/kwort/power-profile.sh performance
+
+# compositor.sh enable / disable: creates or removes
+# /etc/X11/xinit/xinitrc.d/0-compositor.sh.  Starting / stopping the
+# compositor itself runs as the user and needs no rule.
+Cmnd_Alias  KWORT_COMPOSITOR = /usr/lib/kwort/compositor.sh --link on, \
+                               /usr/lib/kwort/compositor.sh --link off
+
+# network-setup.sh:
+#   DNS cloudflare|google|custom -> "tee /etc/resolv.conf" (content on stdin)
+#   REBIND <iface> and DNS dhcp  -> the script re-runs "REBIND <iface>" as
+#       root, checks the interface name, then runs "dhcpcd -n -- <iface>".
+#       Allowing dhcpcd directly would need "dhcpcd -n *", which would let
+#       any user pass dhcpcd its own options (e.g. -c <script>, run as root).
+Cmnd_Alias  KWORT_NETWORK = /usr/bin/tee /etc/resolv.conf, \
+                            /bin/tee /etc/resolv.conf, \
+                            /usr/lib/kwort/network-setup.sh REBIND *
+
+Cmnd_Alias  KWORT_CMDS = KWORT_POWER, KWORT_COMPOSITOR, KWORT_NETWORK
+
+# These run from the systray, which has no terminal.
+Defaults!KWORT_CMDS  !requiretty
+
+KWORT_USERS ALL = (root) NOPASSWD: KWORT_CMDS
