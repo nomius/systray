@@ -243,13 +243,22 @@ dns_set() {
 rebind_ip() {
     local iface=${1:-}
     [[ -n $iface ]] || usage
-    [[ $iface =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid interface name '$iface'"
-    command -v dhcpcd >/dev/null 2>&1 || die "dhcpcd not found"
+    # must not start with "-": "-cfoo" would make dhcpcd run ./foo as root
+    [[ $iface =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "invalid interface name '$iface'"
 
+    # Not root: re-run only this step through sudo, so sudoers can allow
+    # exactly "network-setup.sh REBIND *" (see kwort-systray.sudoers) and the
+    # interface name is checked above, as root, before dhcpcd sees it.
+    if (( EUID != 0 )); then
+        command -v sudo >/dev/null 2>&1 || die "root is required and sudo is not available"
+        sudo -n -- "$(readlink -f "$0")" REBIND "$iface" ||
+            die "'sudo -n $(readlink -f "$0") REBIND $iface' failed (see kwort-systray.sudoers)"
+        return 0
+    fi
+
+    command -v dhcpcd >/dev/null 2>&1 || die "dhcpcd not found"
     log "rebinding IP on $iface: dhcpcd -n $iface"
-    local -a pre=()
-    (( EUID != 0 )) && pre=(sudo -n)
-    ${pre[@]+"${pre[@]}"} dhcpcd -n "$iface" || die "dhcpcd -n $iface failed"
+    dhcpcd -n -- "$iface" || die "dhcpcd -n $iface failed"
     log "dhcpcd rebind requested for $iface"
 }
 
