@@ -3,8 +3,8 @@
 A lightweight X11 system tray application for the [Kwort Linux](https://kwort.org)
 desktop. It docks four icons into the panel's system tray (tint2 on Kwort):
 **network**, **display**, **audio** and **battery**. Clicking an icon opens a
-popup for that area. The application is written in C using Xlib/XRandR, cairo
-and pango, with no toolkit dependency.
+popup enabling configuration for that aspect of the system. The application is
+written in C using Xlib/XRandR, cairo and pango, with no toolkit dependency.
 
 Each icon is its own XEmbed client window docked through the freedesktop
 system tray protocol (`_NET_SYSTEM_TRAY_Sn`). If the tray restarts, for example
@@ -44,10 +44,10 @@ modification required (or small adjustments).
   to the nearest position where monitors don't overlap.
 - **Displays** list: left-click a display to make it primary. Right-click opens
   a *Disable display* menu. You can't disable the last active display, and
-  disabling the primary moves the primary to the laptop panel (eDP/LVDS) or to
-  another active display.
-- When the primary display changes, tint2 and the systray are restarted so the
-  panel moves to the new primary.
+  disabling the primary moves the primary to eDP/LVDS (if available on a
+  laptop) or to another active display.
+- When the primary display changes, the dock panel (tint2 by default) and the
+  systray are restarted so the panel moves to the new primary.
 - **Compositor management** menu, for UI glitches or a misbehaving compositor:
   *Restart compositor*, *Stop compositor* and *Disable/Enable compositor*.
 
@@ -85,8 +85,9 @@ make install DESTDIR="$PWD/pkg"    # staged install for packaging (no sudo)
 ```
 
 Install paths can be overridden: `PREFIX` (default `/usr`), `SCRIPTDIR`
-(`/usr/lib/kwort`), `UDEVDIR` (`/etc/udev/rules.d`), `XINITRCDIR`
-(`/etc/X11/xinit/xinitrc.d`) and `SUDOERSDIR` (`/etc/sudoers.d`).
+(`/usr/lib/kwort`), `UDEVDIR` (`/etc/udev/rules.d`), `SYSCTLDIR`
+(`/etc/sysctl.d`), `XINITRCDIR` (`/etc/X11/xinit/xinitrc.d`) and
+`SUDOERSDIR` (`/etc/sudoers.d`).
 
 Start it with your session, after the panel, e.g. from `~/.xinitrc` or your
 autostart:
@@ -105,12 +106,15 @@ kwort-systray &
 | `$(SCRIPTDIR)/compositor.sh` | 0755 | Compositor control |
 | `$(SCRIPTDIR)/display-change.sh` | 0755 | Display hotplug and panel restart |
 | `$(UDEVDIR)/89-kwort-video.rules` | 0644 | Backlight permissions and display hotplug |
+| `$(SYSCTLDIR)/ping.conf` | 0644 | Allows unprivileged ICMP sockets (ping to the gateway) |
 | `$(XINITRCDIR)/0-compositor.sh` | symlink | Starts the compositor with X (created on first install only) |
 | `$(SUDOERSDIR)/kwort-systray` | 0440 | Passwordless sudo for the helper scripts |
 
-When installing directly into the system (no `DESTDIR`), it also reloads the
-udev rules and re-triggers the backlight devices so the new permissions apply
-right away.
+When installing directly into the system (no `DESTDIR`), it also applies
+`ping.conf` with `sysctl -p`, reloads the udev rules and re-triggers the
+backlight devices, so the new settings take effect without a reboot. A staged
+install leaves the running system alone, so a package should do these steps
+in its post-install script.
 
 ## Internal setup
 
@@ -133,9 +137,26 @@ package must then apply the capability itself in its post-install step.
 Rebuilding or copying the binary drops the capability, so run `make install`
 again afterwards.
 
-Ping uses an unprivileged ICMP datagram socket. If the
-`net.ipv4.ping_group_range` sysctl doesn't include the user's group, it falls
-back to `ping(8)`.
+### Kernel parameters (`ping.conf`)
+
+The ping and packet loss figures in the network popup come from an
+unprivileged ICMP datagram socket (`socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)`),
+so the binary doesn't need `CAP_NET_RAW`. The kernel only allows that socket
+for groups inside the `net.ipv4.ping_group_range` sysctl, and its default
+(`1 0`) allows no group at all. `ping.conf` opens it to every group:
+
+```
+net.ipv4.ping_group_range=0 2147483647
+```
+
+`make install` installs it to `$(SYSCTLDIR)/ping.conf` (`/etc/sysctl.d`), where
+it is applied at every boot. A direct install (no `DESTDIR`) also loads it
+right away with `sysctl -p`. To
+limit it to one group, replace the range with that group's GID twice, e.g.
+`net.ipv4.ping_group_range=100 100` for `users`.
+
+If the socket isn't allowed, kwort-systray falls back to running `ping(8)`
+once per measurement, which is slower and needs iputils.
 
 ### Helper scripts
 
@@ -182,9 +203,10 @@ through `sudo -n` to write to sysfs.
 compositor.sh [start] | stop | restart | enable | disable | status
 ```
 
-- The compositor command is set at the top of the script
-  (`KWORT_COMPOSITOR="xcompmgr -c -f -C -r 5 -o .6 -D 5"`). Edit it to use
-  another compositor.
+- The compositor command is the `KWORT_COMPOSITOR` variable at the top of
+  the script (default `xcompmgr -c -f -C -r 5 -o .6 -D 5`). To use another
+  compositor, edit it or set it in the environment (see
+  [Choosing the panel and compositor](#choosing-the-panel-and-compositor)).
 - `/etc/X11/xinit/xinitrc.d/0-compositor.sh` is a **symlink to this script**.
   xinitrc *sources* the files in that directory. When sourced, the script only
   starts the compositor in the background.
@@ -206,7 +228,8 @@ display-change.sh --restart-panel  # run by kwort-systray or by itself
 - **udev calls this script whenever a display is plugged in or unplugged**
   (a DRM `change` uevent on `card0`, see `89-kwort-video.rules`). It detaches
   from udev, waits for the change to settle and gets the X session's
-  environment from the running tint2 or kwort-systray process.
+  environment from the running dock panel (tint2 by default) or kwort-systray
+  process.
   - If a display was unplugged but is still active, it's turned off with
     `xrandr --off`. If it was the primary, the primary moves to the laptop
     panel or to another active display.
@@ -214,15 +237,46 @@ display-change.sh --restart-panel  # run by kwort-systray or by itself
     on again with `--auto --right-of <primary>`. Some monitors otherwise show
     "no signal" even though X considers them active.
   - Afterwards it restarts the panel as the desktop user.
-- `--restart-panel` stops every tint2 and kwort-systray process of the user,
-  which also cleans up duplicates, and starts one of each again with its
-  original command line and environment. A per-user lock
-  (`/run/user/<uid>/kwort-panel.lock`) stops two restarts from overlapping.
+- `--restart-panel` stops every dock panel (tint2 by default) and
+  kwort-systray process of the user,  which also cleans up duplicates, and
+  starts one of each again with its original command line and environment. A
+  per-user lock (`/run/user/<uid>/kwort-panel.lock`) stops two restarts from
+  overlapping.
   kwort-systray also uses this after changing or disabling the primary
   display.
+- The panel is the `KWORT_PANEL` variable at the top of the script (default
+  `tint2`). To use another panel, edit it or set it in the environment (see
+  below).
 - State and lock files: `/run/kwort-display.state` and
   `/run/kwort-display.lock`. Messages go to syslog with the tag
   `display-change`.
+
+#### Choosing the panel and compositor
+
+Both variables keep the value they already have in the environment, and use
+the default only when it is unset or empty:
+
+| Variable | Script | Default |
+|---|---|---|
+| `KWORT_PANEL` | `display-change.sh` | `tint2` |
+| `KWORT_COMPOSITOR` | `compositor.sh` | `xcompmgr -c -f -C -r 5 -o .6 -D 5` |
+
+Export them in the desktop session before X starts, e.g. in
+`~/.bash_profile`, so that xinitrc, the panel and kwort-systray all see them:
+
+```sh
+export KWORT_PANEL=polybar
+export KWORT_COMPOSITOR="picom --backend glx"
+```
+
+The first word of each is the program name used to find the running process.
+The panel is normally restarted with its own command line, so options such
+as `tint2 -c <config>` are kept. The value of `KWORT_PANEL` is used to start
+it only when that command line can't be read.
+
+When udev runs `display-change.sh`, the session's variables aren't available,
+so the script reads `KWORT_PANEL` from the running kwort-systray process and
+passes it on to `--restart-panel`.
 
 #### Overriding script paths
 
@@ -301,13 +355,14 @@ group.
 | libpulse (PulseAudio, or PipeWire with pipewire-pulse) | Audio |
 | libnl-3 / libnl-genl-3 | Wi-Fi information and scans (nl80211) |
 | `xrandr` | Changing the display layout, primary display, enabling and disabling displays |
-| tint2 (or another freedesktop system tray) | Hosting the icons. Panel restarts expect tint2 |
+| tint2 (or another freedesktop system tray) | Hosting the icons. |
 | `wpa_supplicant` and `wpa_cli` | Wi-Fi networks and connecting |
 | `dhcpcd` | DHCP rebind and DNS from DHCP |
 | `sudo` | Privileged steps of the helper scripts |
 | eudev or systemd-udev | Display hotplug and backlight permissions |
 | `setcap` (libcap) | Setting `cap_net_admin` at install time |
 | `bash`, `util-linux` (`flock`, `setsid`, `logger`), `procps` (`pgrep`, `pkill`) | Helper scripts |
+| `sysctl` (procps) | Loading `ping.conf` at install time |
 | `xcompmgr` (or the compositor configured in `compositor.sh`) | Compositor management |
 | `ping` (iputils), optional | Ping fallback when unprivileged ICMP sockets aren't allowed |
 | cpufreq / ACPI `platform_profile` support in the kernel | Power profiles |

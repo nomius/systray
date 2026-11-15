@@ -18,10 +18,11 @@
 #           -> display-change.sh --restart-panel, as the desktop user.
 #
 #   display-change.sh --restart-panel
-#       Restart tint2 and kwort-systray so they follow the new layout (tint2
-#       stays on the output that was primary when it started).  Also used by
-#       kwort-systray itself after changing or disabling the primary display.
-#       Must run as the desktop user.  Does nothing if tint2 is not running.
+#       Restart the panel ($KWORT_PANEL, tint2 by default) and kwort-systray
+#       so they follow the new layout (tint2 stays on the output that was
+#       primary when it started).  Also used by kwort-systray itself after
+#       changing or disabling the primary display.  Must run as the desktop
+#       user.  Does nothing if the panel is not running.
 #
 # Output names and their state come from "xrandr --query", not from
 # /sys/class/drm: sysfs names (HDMI-A-1) do not always match xrandr's
@@ -30,6 +31,18 @@
 # The connected outputs are remembered in $STATE, so repeated uevents for
 # the same change (and any uevents our own xrandr calls cause) do nothing.
 
+# The panel (dock) that hosts the system tray.  Change it here, or export
+# KWORT_PANEL in the desktop session (e.g. from ~/.bash_profile before
+# startx), to use another panel.  The first word is the program name used to
+# find the running panel; the whole line is only used to start it when the
+# running panel's command line cannot be read (normally it is restarted with
+# its own command line, so e.g. "tint2 -c <config>" is kept).
+# Run from udev, the session's KWORT_PANEL is read from the running
+# kwort-systray process.
+KWORT_PANEL=${KWORT_PANEL:-tint2}
+PANEL_NAME=${KWORT_PANEL%% *}             # process name, e.g. tint2
+PANEL_NAME=${PANEL_NAME##*/}
+
 log() { logger -t display-change "$*"; }
 
 # ===========================================================================
@@ -37,9 +50,9 @@ log() { logger -t display-change "$*"; }
 #
 # Everything that restarts the panel goes through here, under one per-user
 # lock, so two restarts (udev + systray) can never overlap.  It stops *all*
-# tint2 / kwort-systray processes of the user (cleaning up duplicates),
+# panel / kwort-systray processes of the user (cleaning up duplicates),
 # waits until they are really gone, and starts one of each again, unless one
-# is already running by then (tint2 respawned by the session / window
+# is already running by then (panel respawned by the session / window
 # manager), so there is never a second copy.
 # ===========================================================================
 restart_panel() {
@@ -52,22 +65,22 @@ restart_panel() {
     flock -w 30 8 || { log "panel restart: lock busy for 30s, skipped"; return 1; }
 
     local -a t_pids s_pids t_env t_cmd s_env s_cmd
-    mapfile -t t_pids < <(pgrep -x -u "$uid" tint2)
-    [ ${#t_pids[@]} -gt 0 ] || { log "tint2 is not running: nothing to restart"; return 0; }
+    mapfile -t t_pids < <(pgrep -x -u "$uid" "$PANEL_NAME")
+    [ ${#t_pids[@]} -gt 0 ] || { log "$PANEL_NAME is not running: nothing to restart"; return 0; }
     mapfile -t s_pids < <(pgrep -x -u "$uid" kwort-systray)
-    [ ${#t_pids[@]} -gt 1 ] && log "found ${#t_pids[@]} tint2 processes (${t_pids[*]}); restarting only one"
+    [ ${#t_pids[@]} -gt 1 ] && log "found ${#t_pids[@]} $PANEL_NAME processes (${t_pids[*]}); restarting only one"
     [ ${#s_pids[@]} -gt 1 ] && log "found ${#s_pids[@]} kwort-systray processes (${s_pids[*]}); restarting only one"
 
     # command line + environment of the oldest of each, so options such as
     # "tint2 -c <config>" are kept
     mapfile -d '' t_cmd 2>/dev/null < "/proc/${t_pids[0]}/cmdline"
     mapfile -d '' t_env 2>/dev/null < "/proc/${t_pids[0]}/environ"
-    [ ${#t_cmd[@]} -gt 0 ] || t_cmd=(tint2)
+    [ ${#t_cmd[@]} -gt 0 ] || read -r -a t_cmd <<<"$KWORT_PANEL"
     [ ${#t_env[@]} -gt 0 ] || mapfile -d '' t_env < <(env -0)
     if [ ${#s_pids[@]} -gt 0 ]; then
         mapfile -d '' s_cmd 2>/dev/null < "/proc/${s_pids[0]}/cmdline"
         # environ is unreadable when kwort-systray has file capabilities
-        # (setcap makes it non-dumpable): use tint2's session environment
+        # (setcap makes it non-dumpable): use the panel's session environment
         mapfile -d '' s_env 2>/dev/null < "/proc/${s_pids[0]}/environ"
         [ ${#s_cmd[@]} -gt 0 ] || s_cmd=(kwort-systray)
         [ ${#s_env[@]} -gt 0 ] || s_env=("${t_env[@]}")
@@ -91,13 +104,13 @@ restart_panel() {
 
     # start one of each, unless something already brought it back
     sleep 0.3
-    if pgrep -x -u "$uid" tint2 >/dev/null; then
-        log "tint2 was already started again by someone else (session or window manager); not starting another"
+    if pgrep -x -u "$uid" "$PANEL_NAME" >/dev/null; then
+        log "$PANEL_NAME was already started again by someone else (session or window manager); not starting another"
     else
         log "restarting: ${t_cmd[*]}"
         setsid env -i "${t_env[@]}" "${t_cmd[@]}" </dev/null >/dev/null 2>&1 8>&- 9>&- &
     fi
-    sleep 1                               # let tint2 claim the tray
+    sleep 1                               # let the panel claim the tray
     if [ ${#s_pids[@]} -gt 0 ]; then
         if pgrep -x -u "$uid" kwort-systray >/dev/null; then
             log "kwort-systray was already started again; not starting another"
@@ -140,18 +153,20 @@ exec 9>"$LOCK"
 flock 9                                   # one run at a time
 
 # ---------------------------------------------------------------------------
-# Desktop session: user, DISPLAY, XAUTHORITY.  Taken from a running X client
-# of the user (tint2 / kwort-systray), falling back to the first logged-in
-# user with :0 and ~/.Xauthority.
+# Desktop session: user, DISPLAY, XAUTHORITY and KWORT_PANEL.  Taken from a
+# running X client of the user (kwort-systray first: it knows the session's
+# KWORT_PANEL, and root can read its environ despite setcap; then the
+# panel), falling back to the first logged-in user with :0 and
+# ~/.Xauthority.
 # ---------------------------------------------------------------------------
 REAL_USER=$(id -un)
 if [ "$(id -u)" -eq 0 ]; then
-    pid=$(pgrep -o -x tint2 || pgrep -o -x kwort-systray)
+    pid=$(pgrep -o -x kwort-systray || pgrep -o -x "$PANEL_NAME")
     if [ -n "$pid" ]; then
         REAL_USER=$(ps -o user= -p "$pid" | tr -d ' ')
         while IFS= read -r -d '' kv; do
             case $kv in
-                DISPLAY=*|XAUTHORITY=*|XDG_RUNTIME_DIR=*) export "${kv?}" ;;
+                DISPLAY=*|XAUTHORITY=*|XDG_RUNTIME_DIR=*|KWORT_PANEL=?*) export "${kv?}" ;;
             esac
         done < "/proc/$pid/environ"
     else
@@ -250,5 +265,6 @@ done
 printf '%s\n' $connected_now > "$STATE"
 [ "$changed" = 1 ] || exit 0
 
-as_user bash "$(readlink -f "$0")" --restart-panel
+# KWORT_PANEL passed explicitly: su does not guarantee to keep the environment
+as_user env KWORT_PANEL="$KWORT_PANEL" bash "$(readlink -f "$0")" --restart-panel
 exit 0

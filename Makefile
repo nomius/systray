@@ -14,6 +14,7 @@ LDLIBS  := $(shell pkg-config --libs $(PKGS)) -lpthread -lm
 PREFIX    ?= /usr
 SCRIPTDIR ?= /usr/lib/kwort
 UDEVDIR   ?= /etc/udev/rules.d
+SYSCTLDIR ?= /etc/sysctl.d
 XINITRCDIR ?= /etc/X11/xinit/xinitrc.d
 SUDOERSDIR ?= /etc/sudoers.d
 # Staged installs (packaging) never need sudo: make install DESTDIR=$(pwd)/pkg
@@ -49,12 +50,14 @@ endif
 	$(SUDO) install -Dm755 display-change.sh $(DESTDIR)$(SCRIPTDIR)/display-change.sh
 	-$(SUDO) rm -f $(DESTDIR)$(SCRIPTDIR)/disable-display.sh   # renamed to display-change.sh
 	$(SUDO) install -Dm644 89-kwort-video.rules $(DESTDIR)$(UDEVDIR)/89-kwort-video.rules
+	$(SUDO) install -Dm644 ping.conf $(DESTDIR)$(SYSCTLDIR)/ping.conf
 	@# sudoers: paths follow SCRIPTDIR; refuse to install a file visudo rejects
 	sed "s#/usr/lib/kwort/#$(SCRIPTDIR)/#g" kwort-systray.sudoers > kwort-systray.sudoers.out
 	if command -v visudo >/dev/null 2>&1; then visudo -cf kwort-systray.sudoers.out; fi
 	$(SUDO) install -Dm440 kwort-systray.sudoers.out $(DESTDIR)$(SUDOERSDIR)/kwort-systray
 	rm -f kwort-systray.sudoers.out
 ifeq ($(strip $(DESTDIR)),)
+	-$(SUDO) sysctl -p $(SYSCTLDIR)/ping.conf
 	-$(SUDO) udevadm control --reload-rules
 	-$(SUDO) udevadm trigger --subsystem-match=backlight
 endif

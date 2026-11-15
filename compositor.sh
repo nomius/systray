@@ -19,8 +19,10 @@
 # script through "sudo -n" for that step (allow it in sudoers with NOPASSWD,
 # like power-profile.sh).
 
-# The compositor command line.  Change it to use another compositor.
-KWORT_COMPOSITOR="xcompmgr -c -f -C -r 5 -o .6 -D 5"
+# The compositor command line.  Change it here, or export KWORT_COMPOSITOR in
+# the desktop session (e.g. from ~/.bash_profile before startx, so both
+# xinitrc and the systray see it), to use another compositor.
+KWORT_COMPOSITOR=${KWORT_COMPOSITOR:-"xcompmgr -c -f -C -r 5 -o .6 -D 5"}
 
 case ${0##*/} in
 *compositor.sh) kwort_comp_sourced=0 ;;   # run as a command
