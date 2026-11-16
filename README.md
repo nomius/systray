@@ -32,6 +32,18 @@ modification required (or small adjustments).
   Wi-Fi scan), with an encryption indicator. Choosing a network that needs a
   password opens a password dialog.
 - **Rebind IP**: asks dhcpcd to renew the lease.
+- The tray icon and the popup header show a Wi-Fi symbol with signal bars,
+  or an Ethernet port when the connection is wired, i.e. when the default
+  route with the lowest metric goes through an Ethernet interface (VPN, PPP
+  and TAP interfaces don't count as wired). The icon is red when there is
+  no network.
+- **VPN:** when a VPN (WireGuard, OpenVPN tun/tap) is up, the popup keeps
+  describing the Wi-Fi or Ethernet link underneath it (signal, ping, traffic)
+  and the icon gets a small yellow "V" badge. The header adds "· VPN", and
+  the tooltip "— VPN <iface>". A VPN counts when it holds the default
+  route, OpenVPN's `def1` routes (`0.0.0.0/1` + `128.0.0.0/1`), or, for
+  setups like wg-quick that route through their own table, whenever its
+  interface is up.
 - Tooltip: the SSID, `<iface> (wired)`, or "No network".
 
 ### Display

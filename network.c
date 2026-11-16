@@ -15,6 +15,7 @@
 
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <dirent.h>
 #include <ifaddrs.h>
 #include <linux/nl80211.h>
 #include <net/if.h>
@@ -61,6 +62,8 @@ static struct {
     char iface[32], ip[32], gw[32];
     int up;                               /* default route present            */
     int wifi;                             /* iface is wireless                */
+    int ether;                            /* iface is Ethernet (not tun/tap)  */
+    char vpn[32];                         /* VPN interface on top, or ""      */
     char ssid[64];
     int freq, dbm, have_dbm;
     double rx_rate, tx_rate;              /* bytes/s                          */
@@ -200,20 +203,99 @@ static void *ping_thread(void *arg)
 /* /proc, /sys, resolv.conf                                            */
 /* ------------------------------------------------------------------ */
 
+/* Ethernet link layer: /sys/class/net/<if>/type is ARPHRD_ETHER (1).  That
+ * is also true for Wi-Fi (told apart by nl80211, see show_wired) and for TAP
+ * devices (they have tun_flags); WireGuard / tun (65534) and PPP (512) are
+ * not Ethernet.  Bridges and bonds over Ethernet count as Ethernet. */
+static int is_ethernet(const char *ifn)
+{
+    char p[128], b[16] = "";
+    FILE *f;
+    snprintf(p, sizeof p, "/sys/class/net/%s/type", ifn);
+    if (!(f = fopen(p, "r"))) return 0;
+    if (!fgets(b, sizeof b, f)) b[0] = 0;
+    fclose(f);
+    if (atoi(b) != 1) return 0;
+    snprintf(p, sizeof p, "/sys/class/net/%s/tun_flags", ifn);
+    return access(p, F_OK) != 0;
+}
+
+/* VPN tunnel: tun / WireGuard (type ARPHRD_NONE, 65534) or a TUN/TAP device
+ * (has tun_flags; covers OpenVPN in tap mode). */
+static int is_vpn(const char *ifn)
+{
+    char p[128], b[16] = "";
+    FILE *f;
+    snprintf(p, sizeof p, "/sys/class/net/%s/tun_flags", ifn);
+    if (access(p, F_OK) == 0) return 1;
+    snprintf(p, sizeof p, "/sys/class/net/%s/type", ifn);
+    if (!(f = fopen(p, "r"))) return 0;
+    if (!fgets(b, sizeof b, f)) b[0] = 0;
+    fclose(f);
+    return atoi(b) == 65534;
+}
+
+/* First VPN interface that is administratively up (IFF_UP).  Used when no
+ * VPN route is visible in the main table: wg-quick routes everything through
+ * its own table plus a policy rule, which /proc/net/route does not show. */
+static int vpn_up_iface(char *out, size_t n)
+{
+    DIR *d = opendir("/sys/class/net");
+    struct dirent *e;
+    int found = 0;
+    if (!d) return 0;
+    while (!found && (e = readdir(d))) {
+        /* interface names are < IFNAMSIZ (16); anything else is not one */
+        if (e->d_name[0] == '.' || strlen(e->d_name) >= IFNAMSIZ) continue;
+        if (!is_vpn(e->d_name)) continue;
+        char p[300], b[32] = "";
+        FILE *f;
+        snprintf(p, sizeof p, "/sys/class/net/%s/flags", e->d_name);
+        if (!(f = fopen(p, "r"))) continue;
+        if (!fgets(b, sizeof b, f)) b[0] = 0;
+        fclose(f);
+        if (strtoul(b, NULL, 16) & 1) {
+            snprintf(out, n, "%.15s", e->d_name);       /* IFNAMSIZ - 1 */
+            found = 1;
+        }
+    }
+    closedir(d);
+    return found;
+}
+
+/* The physical link (lowest-metric default route that is not a VPN) is what
+ * the widget describes: Wi-Fi signal, ping to its gateway, traffic.  A VPN
+ * on top of it only sets N.vpn, shown as a badge on the icon. */
 static void read_route(void)
 {
-    char iface[32] = "", gw[32] = "";
-    long best_metric = -1;
+    char iface[32] = "", gw[32] = "", vpn[32] = "", vpn_def[32] = "";
+    long best_metric = -1, vpn_metric = -1;
     FILE *f = fopen("/proc/net/route", "r");
     if (f) {
         char line[256];
         if (!fgets(line, sizeof line, f)) line[0] = 0;
         while (fgets(line, sizeof line, f)) {
             char ifn[32];
-            unsigned dest, gwv, flags, refcnt, use, metric;
-            if (sscanf(line, "%31s %x %x %x %u %u %u", ifn, &dest, &gwv, &flags,
-                       &refcnt, &use, &metric) != 7) continue;
-            if (dest != 0 || !(flags & 2)) continue;
+            unsigned dest, gwv, flags, refcnt, use, metric, mask;
+            /* Iface Destination Gateway Flags RefCnt Use Metric Mask ...;
+             * addresses are raw network-order words */
+            if (sscanf(line, "%31s %x %x %x %u %u %u %x", ifn, &dest, &gwv, &flags,
+                       &refcnt, &use, &metric, &mask) != 8) continue;
+            if (!(flags & 1)) continue;                        /* RTF_UP */
+            if (is_vpn(ifn)) {
+                /* default route, or OpenVPN "def1": 0.0.0.0/1 + 128.0.0.0/1;
+                 * tunnels often have no gateway (RTF_GATEWAY not set) */
+                int full = mask == 0 && dest == 0;
+                int def1 = mask == htonl(0x80000000u) &&
+                           (dest == 0 || dest == htonl(0x80000000u));
+                if (full && (vpn_metric < 0 || (long)metric < vpn_metric)) {
+                    vpn_metric = metric;
+                    snprintf(vpn_def, sizeof vpn_def, "%s", ifn);
+                }
+                if ((full || def1) && !vpn[0]) snprintf(vpn, sizeof vpn, "%s", ifn);
+                continue;
+            }
+            if (dest != 0 || mask != 0 || !(flags & 2)) continue;
             if (best_metric < 0 || (long)metric < best_metric) {
                 best_metric = metric;
                 snprintf(iface, sizeof iface, "%s", ifn);
@@ -223,6 +305,13 @@ static void read_route(void)
         }
         fclose(f);
     }
+    if (vpn_def[0]) snprintf(vpn, sizeof vpn, "%s", vpn_def);
+    if (!vpn[0]) vpn_up_iface(vpn, sizeof vpn);
+
+    /* only a VPN default route (no physical one visible): describe the VPN
+     * interface itself, as before */
+    if (!iface[0] && vpn_def[0]) snprintf(iface, sizeof iface, "%s", vpn_def);
+
     N.up = iface[0] != 0;
     if (N.up) {
         snprintf(N.iface, sizeof N.iface, "%s", iface);
@@ -230,6 +319,9 @@ static void read_route(void)
     } else {
         N.gw[0] = 0;
     }
+    N.ether = N.up && is_ethernet(iface);
+    /* a VPN only counts while there is a connection under it */
+    snprintf(N.vpn, sizeof N.vpn, "%s", N.up ? vpn : "");
     pthread_mutex_lock(&mu);
     snprintf(ping_gw, sizeof ping_gw, "%s", N.gw);
     pthread_mutex_unlock(&mu);
@@ -766,9 +858,76 @@ static int cur_level(void)
     return (N.wifi && N.have_dbm) ? level_from_dbm(N.dbm) : 3;
 }
 
-static void glyph_wifi(cairo_t *cr, double cx, double cy, double s, Rgba c)
+/* Ethernet (RJ45) port: socket outline with the plug opening and its latch
+ * notch, centred on (cx,cy). */
+static void wired_glyph(cairo_t *cr, double cx, double cy, double s, Rgba c)
 {
-    wifi_glyph(cr, cx, cy, s, c, cur_level());
+    cairo_save(cr);
+    cairo_new_path(cr);
+    cairo_translate(cr, cx, cy);
+    cairo_scale(cr, s / 20.0, s / 20.0);
+    ui_color(cr, c);
+    cairo_set_line_width(cr, 1.9);
+    double x0 = -8, y0 = -7, x1 = 8, y1 = 7, r = 2;     /* socket */
+    cairo_move_to(cr, x0 + r, y0);
+    cairo_arc(cr, x1 - r, y0 + r, r, -1.5708, 0);
+    cairo_arc(cr, x1 - r, y1 - r, r, 0, 1.5708);
+    cairo_arc(cr, x0 + r, y1 - r, r, 1.5708, 3.14159);
+    cairo_arc(cr, x0 + r, y0 + r, r, 3.14159, 4.71239);
+    cairo_close_path(cr);
+    cairo_stroke(cr);
+    cairo_move_to(cr, -5, 4);                           /* opening + notch */
+    cairo_line_to(cr, -5, -2);
+    cairo_line_to(cr, -2.5, -2);
+    cairo_line_to(cr, -2.5, -4);
+    cairo_line_to(cr, 2.5, -4);
+    cairo_line_to(cr, 2.5, -2);
+    cairo_line_to(cr, 5, -2);
+    cairo_line_to(cr, 5, 4);
+    cairo_close_path(cr);
+    cairo_fill(cr);
+    cairo_restore(cr);
+}
+
+/* Wired look: the default route (lowest metric, see read_route) goes through
+ * a real Ethernet interface (not Wi-Fi, VPN or PPP); offline, when there is
+ * no wireless interface at all to fall back on. */
+static int show_wired(void)
+{
+    return N.up ? N.ether && !N.wifi : nwif == 0;
+}
+
+/* VPN badge: a small disc with a "V", at the bottom right of a glyph of
+ * size s centred on (cx,cy).  Ringed in the background colour so it stays
+ * readable over the glyph. */
+static void vpn_badge(cairo_t *cr, double cx, double cy, double s)
+{
+    double r = s * 0.21, bx = cx + s * 0.36, by = cy + s * 0.30;
+    cairo_save(cr);
+    cairo_new_path(cr);
+    ui_color(cr, C_BG);
+    cairo_arc(cr, bx, by, r + s * 0.05, 0, 6.2832);
+    cairo_fill(cr);
+    ui_color(cr, C_YELLOW);
+    cairo_arc(cr, bx, by, r, 0, 6.2832);
+    cairo_fill(cr);
+    ui_color(cr, C_BG);
+    cairo_set_line_width(cr, r * 0.32);
+    cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+    cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
+    cairo_move_to(cr, bx - r * 0.45, by - r * 0.42);
+    cairo_line_to(cr, bx,            by + r * 0.48);
+    cairo_line_to(cr, bx + r * 0.45, by - r * 0.42);
+    cairo_stroke(cr);
+    cairo_restore(cr);
+}
+
+/* tray icon and popup header glyph */
+static void glyph_net(cairo_t *cr, double cx, double cy, double s, Rgba c)
+{
+    if (show_wired()) wired_glyph(cr, cx, cy, s, c);
+    else              wifi_glyph(cr, cx, cy, s, c, cur_level());
+    if (N.vpn[0]) vpn_badge(cr, cx, cy, s);
 }
 
 /* Encryption indicator: closed lock = WPA*, open lock = WEP, "!" = open network */
@@ -931,9 +1090,13 @@ static void popup_draw(cairo_t *cr, int w, int h)
     if (N.wifi && N.ssid[0] && N.up) {
         if (N.have_dbm) snprintf(sub, sizeof sub, "Signal %d dBm (%s)", N.dbm, quality_str(N.dbm));
         else snprintf(sub, sizeof sub, "Wi-Fi");
-    } else if (N.up) snprintf(sub, sizeof sub, "%s", N.wifi ? "Wi-Fi" : "Wired");
+    } else if (N.up) snprintf(sub, sizeof sub, "%s", N.wifi ? "Wi-Fi" : N.ether ? "Wired" : "Connected");
     else snprintf(sub, sizeof sub, "Offline");
-    ui_header(cr, w, glyph_wifi,
+    if (N.vpn[0]) {                                     /* e.g. "Wired · VPN" */
+        size_t l = strlen(sub);
+        snprintf(sub + l, sizeof sub - l, " · VPN");
+    }
+    ui_header(cr, w, glyph_net,
               N.wifi && N.ssid[0] ? N.ssid : N.up ? N.iface : "No network", sub);
 
     /* stats grid */
@@ -969,7 +1132,8 @@ static void popup_draw(cairo_t *cr, int w, int h)
             ui_text(cr, b, w - UI_PAD, BAND_Y + 4, 11, UI_RIGHT | UI_CAPS, C_DIM, 0);
         }
     } else {
-        ui_text(cr, N.up ? "Wired connection" : "No connection", UI_PAD, BAND_Y + 4, 11, UI_CAPS, C_DIM, 0);
+        ui_text(cr, !N.up ? "No connection" : N.ether ? "Wired connection" : "Connected",
+                UI_PAD, BAND_Y + 4, 11, UI_CAPS, C_DIM, 0);
     }
     ui_sep(cr, BAND_Y + 22, w);
 
@@ -1211,14 +1375,22 @@ static void popup_close(void) { popup_open_flag = 0; }
 
 static void draw_icon(cairo_t *cr, int w, int h)
 {
-    wifi_glyph(cr, w / 2.0, h / 2.0 - 2, h * 0.75, N.up ? C_BLUE : C_RED, cur_level());
+    Rgba c = N.up ? C_BLUE : C_RED;
+    if (show_wired()) wired_glyph(cr, w / 2.0, h / 2.0, h * 0.75, c);
+    else              wifi_glyph(cr, w / 2.0, h / 2.0 - 2, h * 0.75, c, cur_level());
+    if (N.vpn[0]) vpn_badge(cr, w / 2.0, h / 2.0, h * 0.75);
 }
 
 static int tooltip(char *buf, size_t n)
 {
     if (!N.up) snprintf(buf, n, "No network");
     else if (N.wifi && N.ssid[0]) snprintf(buf, n, "%s", N.ssid);
-    else snprintf(buf, n, "%s (wired)", N.iface);
+    else if (N.ether) snprintf(buf, n, "%s (wired)", N.iface);
+    else snprintf(buf, n, "%s", N.iface);
+    if (N.up && N.vpn[0] && strcmp(N.vpn, N.iface)) {  /* "MyWifi — VPN wg0" */
+        size_t l = strlen(buf);
+        if (l < n) snprintf(buf + l, n - l, " — VPN %s", N.vpn);
+    }
     return 1;
 }
 
