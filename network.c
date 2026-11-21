@@ -1,11 +1,16 @@
 /* network.c - connection status, DNS provider and Wi-Fi selection.
  *
  * - Wi-Fi name / band / signal / scan list : libnl-3 + nl80211 (generic netlink)
+ * - Connection type : /proc/net/route + /sys/class/net (Wi-Fi, Ethernet, VPN
+ *   badge over the physical link)
  * - Ping + packet loss to the default gateway : background thread (ICMP)
  * - DNS provider : nameserver lines of /etc/resolv.conf
- * - Clicking a DNS provider / network runs the setup script:
- *       script DNS  <dhcp|cloudflare|google|custom>
- *       script WIFI <ssid> <ssid>
+ * - Known networks : wpa_supplicant control socket ($SYSTRAY_WPA_DIR)
+ * - Buttons and network rows run the setup script:
+ *       script WIFI <interface> <essid> <address> <open|wep|wpa|wpa2|wpa3>
+ *                   (secret only in the environment: WIFI_PASSWORD)
+ *       script DNS  <dhcp|cloudflare|google|custom> [interface]
+ *       script REBIND <interface>
  *   (script path: $SYSTRAY_NET_SCRIPT or NET_SCRIPT_DEFAULT)
  */
 #ifndef _GNU_SOURCE
